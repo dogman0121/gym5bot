@@ -2,4 +2,4 @@ aiogram
 asyncio
 regex
 requests
-seleniumf
+selenium
