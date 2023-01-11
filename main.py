@@ -1,115 +1,205 @@
-import asyncio
-import json
-import os
-import re
-from datetime import datetime, timedelta
+import logging
 
-from aiogram import Bot, Dispatcher, executor, types
-from aiogram.utils import exceptions
+from aiogram import Bot, Dispatcher, executor, types, utils
+from aiogram.dispatcher import FSMContext
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
 
-from TOKEN import TOKEN
-from browser import WebFunction
+from web_func import *
+from utils import *
+from config import API_TOKEN
+from user import User
 from database import Database
+from exceptions import *
+import datetime
+import json
+from keyboards import basedKeyboard
+import re
 
-bot = Bot(token=TOKEN)
-dp = Dispatcher(bot)
-browser = WebFunction()
-database = Database()
+# Configure logging
+logging.basicConfig(level=logging.INFO)
 
-loop = asyncio.get_event_loop()
+# Initialize bot and dispatcher
+bot = Bot(token=API_TOKEN)
+dp = Dispatcher(bot, storage=MemoryStorage())
 
-with open("books_data.json", "r", encoding="utf-8") as f:
-    books = json.load(f)
+db = Database()
 
-
-# функция по парсингу и обработке замен
-async def timeprocess():
-    while True:
-        for built in ["А", "Т"]:
-            dateTomorrow = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
-            changesResult = browser.get_changes(dateTomorrow, built)
-            if not os.path.exists(f"zameny\\{dateTomorrow}_{built}.json"):
-                if not (changesResult == "Для этого дня замен нет."):
-                    with open(f"zameny\\{dateTomorrow}_{built}.json", "w", encoding="utf-8") as file:
-                        json.dump(changesResult, file, indent=2, ensure_ascii=False)
-                    for classNumber in changesResult.keys():
-                        changesString = classNumber + "\n"
-                        for lessonNumber in changesResult[classNumber].keys():
-                            changesString += lessonNumber + ": " + changesResult[classNumber][lessonNumber] + "\n"
-                        cs = re.findall(r"(\d{1,2})(\w{0,1}?)( )?/(\w)", classNumber)
-                        if cs[0][1] == "":
-                            spisokStudents = database.user_data_by_params(grade=cs[0][0], built=cs[0][3])
-                        else:
-                            spisokStudents = database.user_data_by_params(grade=cs[0][0], symbol=cs[0][1],
-                                                                          built=cs[0][3])
-                        for student in spisokStudents:
-                            try:
-                                await bot.send_message(student[0],
-                                                       f"Расписание на следующий день доступно: \n{changesString}")
-                            except exceptions.ChatNotFound:
-                                pass
-        await asyncio.sleep(3600)
+books = json.load(open("books_data.json", "r", encoding="utf-8"))
 
 
-# кнопка старт
+""" Регистрация пользователя """
+
+
 @dp.message_handler(commands=["start"])
-async def start(message: types.Message):
-    await bot.send_message(message.from_user.id,
-                           "Привет! Чтобы было проще пользоваться функциями бота авторизируйся. "
-                           "Напиши информацию о себе. <Имя> <Фамилия> <Класс> <Корпус>."
-                           "\nНапример: Иван Иванов 7А А")
+async def start_command(message: types.Message):
+    await message.answer(
+        "Привет, на связи гимназический бот!\n\n"
+        "Он создан для того, чтобы собрать такие функции как просмотр расписания, замен и т.д. в одном месте.\n\n"
+        "Чтобы зарегистрироваться, отправьте команду /register и следуйте указаниям."
+    )
 
 
-# отправление расписания по запросу
+@dp.message_handler(state=RegistrationUser.waiting_to_register)
+async def get_user_data(message: types.Message, state: FSMContext):
+    try:
+        user = User.get_data_from_text(message.from_user.id, message.text)
+        db.add_user(user)
+        await message.answer("Регистрация прошла успешно", reply_markup=basedKeyboard)
+        await state.finish()
+    except UserCreationError:
+        await message.answer("Ошибка регистрации! Проверьте правильность написания данный. Пример: Иванов Иван 11А А")
+
+
+async def start_registration(message: types.Message, state: FSMContext):
+    await message.answer(
+        "Как тебя зовут?\n"
+        "Напиши о себе в формате <фамилия> <имя> <класс> <литера класса> <корпус>\n"
+        "Например: Иванов Иван 11А А"
+    )
+    await state.set_state(RegistrationUser.waiting_to_register.state)
+
+
+@dp.callback_query_handler(lambda call: call.data == "register_yes")
+async def confirm_registration(callback: types.CallbackQuery, state: FSMContext):
+    await start_registration(callback.message, state)
+
+
+@dp.callback_query_handler(lambda call: call.data == "register_no")
+async def confirm_registration(callback: types.CallbackQuery, state: FSMContext):
+    await bot.edit_message_text(
+        chat_id=callback.from_user.id,
+        text="Вы уже зарегестрированы, хотите перерегестрироваться заново?\n\n *_Отменено_*",
+        parse_mode="MarkdownV2",
+        message_id=callback.message.message_id
+    )
+
+
+@dp.message_handler(commands=["register"])
+async def register_command(message: types.Message, state: FSMContext):
+    try:
+        db.get_user_data(message.from_user.id)
+
+        button_yes = types.InlineKeyboardButton("Да", callback_data="register_yes")
+        button_no = types.InlineKeyboardButton("Нет", callback_data="register_no")
+        buttons = types.InlineKeyboardMarkup()
+        buttons.add(button_yes, button_no)
+
+        await message.answer("Вы уже зарегестрированы, хотите перерегестрироваться заново?", reply_markup=buttons)
+    except UserNotFoundError:
+        await start_registration(message, state)
+
+
+""" Функции связанные с расписанием """
+
+
+async def send_schedule(user, msg_id):
+    schedule = get_schedule(user)
+
+    await bot.edit_message_text(chat_id=user.telegram_id, text="Ваше расписание готово", message_id=msg_id)
+    await bot.send_document(user.telegram_id, ("schedule.png", schedule))
+
+
+@dp.message_handler(lambda message: message.text == "🕑 Расписание")
+async def schedule_from_keyboard(message: types.Message):
+    try:
+        user = db.get_user_data(message.from_user.id)
+        msg = await message.answer("Ждите...")
+        await send_schedule(user, msg.message_id)
+    except UserNotFoundError:
+        await message.answer("Зарегистрируйтесь, чтобы воспользоваться данной функцией. Чтобы зарегестрироваться: /register")
+
+
 @dp.message_handler(commands=["schedule"])
-async def message(message: types.Message):
-    user_inf = re.findall(r"(/schedule) (\w+) (\w+) (\d+) (\w) (\w)", message.text)
-    if len(user_inf) > 0:
-        timetable = browser.get_schedule(user_inf[0][1:])
+async def schedule_command(message: types.Message):
+    try:
+        try:
+            user = User.get_data_from_text(message.from_user.id, message.get_args())
+        except UserCreationError:
+            user = db.get_user_data(message.from_user.id)
+
+        msg = await message.answer("Ждите...")
+        await send_schedule(user, msg.message_id)
+    except UserNotFoundError:
+        await message.answer("Зарегистрируйтесь, чтобы воспользоваться данной функцией. Чтобы зарегестрироваться: /register")
+
+""" Функции, связанные с заменами """
+
+
+async def send_changes(user, msg_id, date):
+    changes = user.get_user_changes(date.strftime("%Y-%m-%d"))
+
+    button_prev = types.InlineKeyboardButton("◀◀", callback_data=(date-datetime.timedelta(days=1)).strftime("%Y-%m-%d"))
+    button_now = types.InlineKeyboardButton(date.strftime("%d.%m.%Y"), callback_data=date.strftime("%Y-%m-%d"))
+    button_next = types.InlineKeyboardButton("▶▶", callback_data=(date+datetime.timedelta(days=1)).strftime("%Y-%m-%d"))
+
+    buttons = types.InlineKeyboardMarkup()
+    buttons.add(button_prev, button_now, button_next)
+
+    try:
+        await bot.edit_message_text(chat_id=user.telegram_id, text=changes, reply_markup=buttons, message_id=msg_id)
+    except utils.exceptions.MessageNotModified:
+        pass
+
+
+@dp.message_handler(lambda message: message.text == "❌ Замены")
+async def changes_from_keyboard(message: types.Message):
+    try:
+        user = db.get_user_data(message.from_user.id)
+        msg = await message.answer("Ждите...")
+
+        today_date = datetime.datetime.now() + datetime.timedelta(days=datetime.datetime.now().hour >= 16)
+
+        await send_changes(user, msg.message_id, today_date)
+    except UserNotFoundError:
+        await message.answer("Зарегистрируйтесь, чтобы воспользоваться данной функцией. Чтобы зарегестрироваться: /register")
+
+@dp.message_handler(commands=["changes"])
+async def changes_command(message: types.Message):
+    try:
+        try:
+            user = User.get_data_from_text(message.from_user.id, message.get_args())
+        except UserCreationError:
+            user = db.get_user_data(message.from_user.id)
+
+        today_date = datetime.datetime.now() + datetime.timedelta(days=datetime.datetime.now().hour >= 16)
+        msg = await message.answer("Ждите...")
+        await send_changes(user, msg.message_id, today_date)
+    except UserNotFoundError:
+        await message.answer("Зарегистрируйтесь, чтобы воспользоваться данной функцией. Чтобы зарегестрироваться: /register")
+
+
+@dp.callback_query_handler(lambda callback: callback.data.startswith("2023"))
+async def changes_call(callback: types.CallbackQuery):
+    user = db.get_user_data(callback.from_user.id)
+
+    date = datetime.datetime.strptime(callback.data, "%Y-%m-%d")
+    await send_changes(user, callback.message.message_id, date)
+
+""" Функции для библиотеки """
+
+
+@dp.message_handler(commands=["library"])
+async def book_command(message: types.Message, state: FSMContext):
+    await message.answer("Привет! Чтобы найти книгу напиши ее название здесь.")
+    await state.set_state(SearchingBook.waiting_to_search.state)
+
+@dp.message_handler(lambda message: message.text == "📚 Книги")
+async def library_from_keyboard(message: types.Message, state: FSMContext):
+    await book_command(message, state)
+
+@dp.message_handler(state=SearchingBook.waiting_to_search)
+async def search_book(message: types.Message, state: FSMContext):
+    answer = ""
+    for book_id in books.keys():
+        if any(not (re.search(i, books[book_id]["name"], flags=re.IGNORECASE) is None) for i in message.text.split()):
+            answer += f"*{books[book_id]['name']}*\nСкачать: /download{book_id}\n\n"
+    if answer == "":
+        await bot.send_message(message.from_user.id, f"По запросу \"{message.text}\" ничего не нашлось.")
     else:
-        if database.check_user(message.from_user.id):
-            timetable = browser.get_schedule(database.get_user_data(message.from_user.id)[0][1:])
-        else:
-            timetable = 0
-    if timetable != 0:
-        await bot.send_photo(message.from_user.id, timetable, caption="Вот ваше расписание")
-    else:
-        await bot.send_message(message.from_user.id,
-                               "Похоже вы неправильно указали ваши данные для просмотра расписания")
+        await bot.send_message(message.from_user.id, "Вот что мне удалось найти:\n\n" + answer, parse_mode="Markdown")
+    await state.finish()
 
 
-# изменение данный пользователя в дб
-@dp.message_handler(commands=["changename"])
-async def change_name(message: types.Message):
-    if not (re.search(r"\w+ \w+ \d+\w \w", message.text) is None):
-        info_student = re.findall(r"(\w+) (\w+) (\d+)(\w) (\w)", message.text)[0]
-        database.update_user(message.from_user.id, info_student)
-        await bot.send_message(message.from_user.id, "Ваши данные успешно изменены.")
-    else:
-        await bot.send_message(message.from_user.id,
-                               "Проверьте правильность написания ваших данных. Образец: Иванов Иван 7А А")
-
-
-# поиск книги в базе данных
-@dp.message_handler(commands="library")
-async def searchbook(message: types.Message):
-    if message.text == "/library":
-        await bot.send_message(message.from_user.id,
-                               "Мы не можем определить ваш запрос. Пожалуйста, напишите подробнее.")
-    else:
-        s = ""
-        for id in books.keys():
-            print(id)
-            if any(not (re.search(i, books[id]["name"], flags=re.IGNORECASE) is None) for i in
-                   message.text[8:].split()):
-                s += f"*{books[id]['name']}*\nСкачать: /download{id}\n\n"
-        if s == "":
-            await bot.send_message(message.from_user.id, f"По запросу \"{message.text[8:]}\" ничего не нашлось.")
-        else:
-            await bot.send_message(message.from_user.id, "Вот что мне удалось найти:\n\n" + s, parse_mode="Markdown")
-
-
-# добавляем документ в базу данных
 @dp.message_handler(content_types=["document"])
 async def get_book(message: types.Message):
     """Если надо будет больше аргументов, используем regex"""
@@ -121,23 +211,13 @@ async def get_book(message: types.Message):
     await bot.send_message(message.from_user.id, "Книга добавлена")
 
 
-@dp.message_handler(content_types=["text"])
-async def only_text(message: types.Message):
-    if not (re.search(r"\w+ \w+ \d+\w \w", message.text) is None):
-        info_student = re.findall(r"(\w+) (\w+) (\d+)(\w) (\w)", message.text)[0]
-        result = database.add_student(message.from_user.id, info_student)
-        if not result:
-            await bot.send_message(message.from_user.id, "Похоже вы уже авторизированы")
-        else:
-            await bot.send_message(message.from_user.id, "Авторизация прошла успешно")
-    if message.text.startswith("/download"):
-        try:
-            print(books[message.text[9:]]["file_id"])
-            await bot.send_document(message.from_user.id, books[message.text[9:]]["file_id"])
-        except KeyError:
-            await bot.send_message(message.from_user.id, "Данный учебник не был найден")
+@dp.message_handler(lambda message: message.text.startswith("/download"))
+async def send_book(message: types.Message):
+    try:
+        await message.answer_document(books[message.text[9:]]["file_id"])
+    except KeyError:
+        await message.answer_document("Данный учебник не был найден")
 
 
 if __name__ == '__main__':
-    loop.create_task(timeprocess())
     executor.start_polling(dp, skip_updates=True)
